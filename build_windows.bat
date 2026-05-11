@@ -41,6 +41,7 @@ python -m PyInstaller --onefile ^
     --hidden-import=zk ^
     --hidden-import=data_storage ^
     --hidden-import=adms_listener ^
+    --hidden-import=_strptime ^
     desktop_app.py
 echo.
 
@@ -53,7 +54,8 @@ python -m PyInstaller background_sync_service.py ^
     --add-data "data_storage.py;." ^
     --add-data "adms_listener.py;." ^
     --hidden-import=data_storage ^
-    --hidden-import=adms_listener 
+    --hidden-import=adms_listener ^
+    --hidden-import=_strptime 
 
 
 echo.

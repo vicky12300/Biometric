@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-# Fix for Windows threading bug with strptime - MUST be imported first
-import _strptime
-
 import http.server
 import socketserver
 import json
@@ -12,6 +9,9 @@ import threading
 import csv
 import io
 import time
+import sys
+import traceback
+import builtins
 if os.name == 'nt':
     import ctypes
     def hide_console_window():
@@ -26,6 +26,76 @@ from urllib.parse import parse_qs
 from zk import ZK, const
 from datetime import datetime, timedelta
 from data_storage import storage
+
+DEBUG_LOG_FILE = os.path.join(storage.get_data_dir(), "biometric_debug.log")
+
+def debug_log(message, exc=None):
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    print(f"[{timestamp}] [WEB] {message}", flush=True)
+    if exc is not None:
+        print(f"[{timestamp}] [WEB] EXCEPTION: {repr(exc)}", flush=True)
+        traceback.print_exc()
+    try:
+        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as log_file:
+            log_file.write(f"[{timestamp}] [WEB] {message}\n")
+            if exc is not None:
+                log_file.write(f"[{timestamp}] [WEB] EXCEPTION: {repr(exc)}\n")
+                log_file.write(traceback.format_exc())
+                log_file.write("\n")
+    except Exception:
+        pass
+
+def safe_strptime(date_string, format_string):
+    value = str(date_string).strip()
+    debug_log(f"safe_strptime called value={value!r}, format={format_string!r}")
+
+    if format_string == "%Y-%m-%d":
+        try:
+            year, month, day = map(int, value.split("-"))
+            parsed = datetime(year, month, day)
+            debug_log(f"safe_strptime parsed date value={value!r} -> {parsed.isoformat()}")
+            return parsed
+        except Exception as exc:
+            debug_log(f"safe_strptime failed for date value={value!r}", exc)
+            raise
+
+    if format_string == "%Y-%m-%d %H:%M:%S":
+        try:
+            date_part, time_part = value.replace("T", " ", 1).split(" ", 1)
+            year, month, day = map(int, date_part.split("-"))
+            hour, minute, second = map(int, time_part.split(":"))
+            parsed = datetime(year, month, day, hour, minute, second)
+            debug_log(f"safe_strptime parsed datetime value={value!r} -> {parsed.isoformat()}")
+            return parsed
+        except Exception as exc:
+            debug_log(f"safe_strptime failed for datetime value={value!r}", exc)
+            raise
+
+    debug_log(f"safe_strptime unsupported format={format_string!r}, value={value!r}")
+    raise ValueError(f"Unsupported date format: {format_string}")
+
+debug_log(
+    "module loaded; "
+    f"python={sys.version!r}; executable={sys.executable!r}; "
+    f"frozen={getattr(sys, 'frozen', False)!r}; "
+    f"_MEIPASS={getattr(sys, '_MEIPASS', None)!r}; "
+    f"_strptime_loaded={'_strptime' in sys.modules}; "
+    f"log_file={DEBUG_LOG_FILE!r}"
+)
+
+_original_import = builtins.__import__
+
+def _debug_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "_strptime":
+        debug_log("IMPORT ATTEMPT for _strptime\n" + "".join(traceback.format_stack(limit=20)))
+    try:
+        return _original_import(name, globals, locals, fromlist, level)
+    except ModuleNotFoundError as exc:
+        if name == "_strptime" or getattr(exc, "name", None) == "_strptime":
+            debug_log(f"IMPORT FAILED for name={name!r}, exc_name={getattr(exc, 'name', None)!r}", exc)
+        raise
+
+builtins.__import__ = _debug_import
 
 class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
     # ... rest of the code remains the same
@@ -4397,6 +4467,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
         elif self.path.startswith('/fetch'):
             query = self.path.split('?')[1] if '?' in self.path else ''
             params = parse_qs(query)
+            debug_log(f"GET /fetch raw_path={self.path!r}, params={params!r}")
             
             ip = params.get('ip', [''])[0]
             port = int(params.get('port', ['4370'])[0])
@@ -4404,13 +4475,18 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             end_date = params.get('endDate', [''])[0] or None
             dummy_mode = params.get('dummy', ['false'])[0].lower() == 'true'
             device_mode = params.get('mode', ['real'])[0]
+            debug_log(f"GET /fetch resolved ip={ip!r}, port={port!r}, start_date={start_date!r}, end_date={end_date!r}, dummy_mode={dummy_mode!r}, device_mode={device_mode!r}")
             
             if dummy_mode:
+                debug_log("GET /fetch using dummy data path")
                 result = self.generate_dummy_data(start_date, end_date)
             elif device_mode == 'adms':
+                debug_log("GET /fetch using ADMS data path")
                 result = self.fetch_adms_data(ip, start_date, end_date)
             else:
+                debug_log("GET /fetch using ZK device data path")
                 result = self.fetch_device_data(ip, port, start_date, end_date)
+            debug_log(f"GET /fetch result success={result.get('success')!r}, error={result.get('error')!r}, message={result.get('message')!r}, records={len(result.get('punchRecords', [])) if isinstance(result, dict) else 'n/a'}")
             
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
@@ -4522,6 +4598,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
     
     def do_POST(self):
+        debug_log(f"do_POST path={self.path!r} from={self.client_address!r}")
         if self.path == '/export':
             self.handle_export()
         elif self.path == '/test-device':
@@ -4699,14 +4776,17 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             }).encode('utf-8'))
     
     def handle_test_device(self):
+        debug_log("handle_test_device started")
         content_length = int(self.headers['Content-Length'])
         post_data = self.rfile.read(content_length)
         data = json.loads(post_data.decode('utf-8'))
         
         ip = data.get('ip')
         port = int(data.get('port', 4370))
+        debug_log(f"handle_test_device payload ip={ip!r}, port={port!r}")
         
         result = self.test_device_connection(ip, port)
+        debug_log(f"handle_test_device result={result!r}")
         
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
@@ -4769,12 +4849,15 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
     
     def fetch_adms_data(self, ip, start_date=None, end_date=None):
         """Return punch records pushed by an ADMS device (e.g. ESSL AIFace Orcus)."""
+        debug_log(f"fetch_adms_data started ip={ip!r}, start_date={start_date!r}, end_date={end_date!r}")
         try:
             from adms_listener import get_buffered_records
             all_records = storage.load_adms_punches()
+            debug_log(f"fetch_adms_data loaded stored ADMS records count={len(all_records)}")
             for r in get_buffered_records():
                 if r not in all_records:
                     all_records.append(r)
+            debug_log(f"fetch_adms_data after buffer merge count={len(all_records)}")
 
             # Filter by device IP or serial number
             # ADMS records have deviceId which could be serial number or IP
@@ -4797,8 +4880,10 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             # If still no records, show all (backward compatibility)
             if not device_records:
                 device_records = all_records
+            debug_log(f"fetch_adms_data matched device_records count={len(device_records)}")
 
             if start_date or end_date:
+                debug_log("fetch_adms_data applying date filter")
                 start_dt = safe_strptime(start_date, "%Y-%m-%d").date() if start_date else None
                 end_dt   = safe_strptime(end_date,   "%Y-%m-%d").date() if end_date   else None
                 device_records = [
@@ -4816,6 +4901,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             
             # Sort by timestamp descending (newest first)
             device_records = sorted(device_records, key=lambda x: x['timestamp'], reverse=True)
+            debug_log(f"fetch_adms_data success final_count={len(device_records)}")
 
             return {
                 'success': True,
@@ -4823,9 +4909,11 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                 'message': f'ADMS: {len(device_records)} records'
             }
         except Exception as e:
+            debug_log("fetch_adms_data failed", e)
             return {'success': False, 'error': str(e)}
 
     def fetch_device_data(self, ip, port=4370, start_date=None, end_date=None):
+        debug_log(f"fetch_device_data started ip={ip!r}, port={port!r}, start_date={start_date!r}, end_date={end_date!r}")
         """
         Fetch attendance from ESSL AirFace Orcus with multiple connection fallbacks.
         Tries TCP/UDP × ommit_ping × password combinations to maximise compatibility.
@@ -4856,27 +4944,34 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
         last_exc = None
         for strat in strategies:
             try:
+                debug_log(f"fetch_device_data trying strategy={strat!r}")
                 zk = ZK(ip, port=port, timeout=30, **strat)
                 conn = zk.connect()
+                debug_log(f"fetch_device_data connected strategy={strat!r}")
                 break
             except Exception as exc:
                 last_exc = exc
                 conn = None
+                debug_log(f"fetch_device_data strategy failed strategy={strat!r}", exc)
 
         if conn is None:
+            debug_log(f"fetch_device_data all strategies failed last_exc={last_exc!r}")
             return {'success': False, 'error': str(last_exc),
                     'message': f'All connection strategies failed: {last_exc}'}
 
         try:
             try:
                 conn.disable_device()
+                debug_log("fetch_device_data device disabled for read")
             except Exception:
+                debug_log("fetch_device_data disable_device failed but continuing")
                 pass
 
             # Build user lookup
             user_dict = {}
             try:
                 users = conn.get_users() or []
+                debug_log(f"fetch_device_data users count={len(users)}")
                 for user in users:
                     clean_name = html.unescape(user.name) if user.name else f'Employee {user.uid}'
                     user_dict[user.uid] = clean_name
@@ -4884,9 +4979,11 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                     if hasattr(user, 'user_id') and user.user_id:
                         user_dict[user.user_id] = clean_name
             except Exception:
+                debug_log("fetch_device_data get_users failed but continuing")
                 pass
 
             attendance = conn.get_attendance()
+            debug_log(f"fetch_device_data raw attendance count={len(attendance) if attendance else 0}")
             records = []
 
             if attendance:
@@ -4905,6 +5002,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
 
                 if not start_date and not end_date:
                     filtered_records = sorted(attendance, key=lambda x: x.timestamp, reverse=True)[:200]
+                debug_log(f"fetch_device_data filtered records count={len(filtered_records)}")
 
                 for record in filtered_records:
                     uid = getattr(record, 'uid', record.user_id)
@@ -4925,9 +5023,12 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
 
             try:
                 conn.enable_device()
+                debug_log("fetch_device_data device enabled after read")
             except Exception:
+                debug_log("fetch_device_data enable_device failed but continuing")
                 pass
 
+            debug_log(f"fetch_device_data success final_count={len(records)}")
             return {
                 'success':      True,
                 'punchRecords': records,
@@ -4935,11 +5036,14 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             }
 
         except Exception as e:
+            debug_log("fetch_device_data failed", e)
             return {'success': False, 'error': str(e)}
         finally:
             try:
                 conn.disconnect()
+                debug_log("fetch_device_data disconnected")
             except Exception:
+                debug_log("fetch_device_data disconnect failed")
                 pass
     
     def generate_dummy_data(self, start_date=None, end_date=None):

@@ -21,25 +21,86 @@ when any device has mode='adms'.
 
 import http.server
 import json
+import os
+import sys
 import threading
+import traceback
+import builtins
 import urllib.parse
 import urllib.request
 from datetime import datetime
 from data_storage import storage
 
-# Fix for Windows threading bug with strptime
-try:
-    import _strptime
-except ImportError:
-    datetime.strptime('2000-01-01', '%Y-%m-%d')
+DEBUG_LOG_FILE = os.path.join(storage.get_data_dir(), "adms_debug.log")
+
+def debug_log(message, exc=None):
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    print(f"[{timestamp}] [ADMS] {message}", flush=True)
+    if exc is not None:
+        print(f"[{timestamp}] [ADMS] EXCEPTION: {repr(exc)}", flush=True)
+        traceback.print_exc()
+    try:
+        with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as log_file:
+            log_file.write(f"[{timestamp}] [ADMS] {message}\n")
+            if exc is not None:
+                log_file.write(f"[{timestamp}] [ADMS] EXCEPTION: {repr(exc)}\n")
+                log_file.write(traceback.format_exc())
+                log_file.write("\n")
+    except Exception:
+        pass
 
 # Thread-safe strptime wrapper
 def safe_strptime(date_string, format_string):
+    value = str(date_string).strip()
+    debug_log(f"safe_strptime called value={value!r}, format={format_string!r}")
+
+    if format_string == "%Y-%m-%d":
+        try:
+            year, month, day = map(int, value.split("-"))
+            parsed = datetime(year, month, day)
+            debug_log(f"safe_strptime parsed date value={value!r} -> {parsed.isoformat()}")
+            return parsed
+        except Exception as exc:
+            debug_log(f"safe_strptime failed for date value={value!r}", exc)
+            raise
+
+    if format_string == "%Y-%m-%d %H:%M:%S":
+        try:
+            date_part, time_part = value.replace("T", " ", 1).split(" ", 1)
+            year, month, day = map(int, date_part.split("-"))
+            hour, minute, second = map(int, time_part.split(":"))
+            parsed = datetime(year, month, day, hour, minute, second)
+            debug_log(f"safe_strptime parsed datetime value={value!r} -> {parsed.isoformat()}")
+            return parsed
+        except Exception as exc:
+            debug_log(f"safe_strptime failed for datetime value={value!r}", exc)
+            raise
+
+    debug_log(f"safe_strptime unsupported format={format_string!r}, value={value!r}")
+    raise ValueError(f"Unsupported date format: {format_string}")
+
+debug_log(
+    "module loaded; "
+    f"python={sys.version!r}; executable={sys.executable!r}; "
+    f"frozen={getattr(sys, 'frozen', False)!r}; "
+    f"_MEIPASS={getattr(sys, '_MEIPASS', None)!r}; "
+    f"_strptime_loaded={'_strptime' in sys.modules}; "
+    f"log_file={DEBUG_LOG_FILE!r}"
+)
+
+_original_import = builtins.__import__
+
+def _debug_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "_strptime":
+        debug_log("IMPORT ATTEMPT for _strptime\n" + "".join(traceback.format_stack(limit=20)))
     try:
-        return datetime.strptime(date_string, format_string)
-    except AttributeError:
-        import time
-        return datetime(*time.strptime(date_string, format_string)[:6])
+        return _original_import(name, globals, locals, fromlist, level)
+    except ModuleNotFoundError as exc:
+        if name == "_strptime" or getattr(exc, "name", None) == "_strptime":
+            debug_log(f"IMPORT FAILED for name={name!r}, exc_name={getattr(exc, 'name', None)!r}", exc)
+        raise
+
+builtins.__import__ = _debug_import
 
 ADMS_PORT = 8000
 
@@ -65,8 +126,10 @@ def _parse_adms_record(params):
       Verified      – verification method (0=finger,1=finger,4=face,15=face…)
       Status        – 0=check-in, 1=check-out, 4=OT-in, 5=OT-out …
     """
+    debug_log(f"_parse_adms_record params_keys={list(params.keys())!r}")
     table = params.get("table", [""])[0]
     if table.upper() != "ATTLOG":
+        debug_log(f"_parse_adms_record skipped table={table!r}")
         return None
 
     user_id   = params.get("UserID",  [None])[0]
@@ -76,16 +139,18 @@ def _parse_adms_record(params):
     sn        = params.get("SN",      ["unknown"])[0]
 
     if not user_id or not stamp:
+        debug_log(f"_parse_adms_record missing user_id/stamp user_id={user_id!r}, stamp={stamp!r}")
         return None
 
     try:
         ts = safe_strptime(stamp.strip(), "%Y-%m-%d %H:%M:%S")
-    except ValueError:
+    except ValueError as exc:
+        debug_log(f"_parse_adms_record invalid stamp={stamp!r}", exc)
         return None
 
     punch_type = "check-in" if str(status) in ("0", "4") else "check-out"
 
-    return {
+    record = {
         "employeeId":   str(user_id).strip(),
         "employeeName": f"Employee {user_id}",   # name resolved later via ERP
         "timestamp":    ts.isoformat(),
@@ -99,6 +164,8 @@ def _parse_adms_record(params):
             "sn":       sn,
         },
     }
+    debug_log(f"_parse_adms_record parsed record employee={record['employeeId']!r}, timestamp={record['timestamp']!r}, punchType={record['punchType']!r}, deviceId={record['deviceId']!r}")
+    return record
 
 
 # ---------------------------------------------------------------------------
@@ -115,37 +182,46 @@ def get_buffered_records(clear=False):
         records = list(_records)
         if clear:
             _records.clear()
+        debug_log(f"get_buffered_records clear={clear!r}, count={len(records)}")
         return records
 
 
 def _store_record(record):
+    debug_log(f"_store_record called employee={record.get('employeeId')!r}, timestamp={record.get('timestamp')!r}, deviceId={record.get('deviceId')!r}")
     with _lock:
         _records.append(record)
+        debug_log(f"_store_record memory_count={len(_records)}")
     # Persist to adms_punches.json via storage helper
     try:
         existing = storage.load_adms_punches()
         existing.append(record)
         # Keep last 10 000 records on disk
         storage.save_adms_punches(existing[-10_000:])
+        debug_log(f"_store_record saved total_after_append={len(existing)}")
     except Exception as e:
+        debug_log("_store_record storage error", e)
         print(f"[ADMS] storage error: {e}")
 
 
 def _relay_to_essl(method: str, path: str, body: bytes = b"") -> bool:
     """Forward the request to ESSL cloud portal if relay is enabled."""
     if not ESSL_RELAY_URL:
+        debug_log(f"_relay_to_essl skipped relay disabled method={method!r}, path={path!r}, body_len={len(body)}")
         return True  # Relay disabled, consider success
     
     try:
         url = ESSL_RELAY_URL + path
+        debug_log(f"_relay_to_essl forwarding method={method!r}, url={url!r}, body_len={len(body)}")
         req = urllib.request.Request(url, data=body if method == "POST" else None, method=method)
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
         
         with urllib.request.urlopen(req, timeout=10) as response:
             response_body = response.read().decode("utf-8", errors="replace")
+            debug_log(f"_relay_to_essl success response_preview={response_body[:200]!r}")
             print(f"[ADMS-RELAY] ✅ Forwarded {method} to ESSL: {url[:80]}")
             return True
     except Exception as e:
+        debug_log("_relay_to_essl failed", e)
         print(f"[ADMS-RELAY] ⚠️  Failed to forward to ESSL: {e}")
         return False
 
@@ -157,14 +233,19 @@ def _relay_to_essl(method: str, path: str, body: bytes = b"") -> bool:
 class ADMSHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
+        debug_log(f"http log from={self.address_string()!r}, message={fmt % args!r}")
         print(f"[ADMS] {self.address_string()} - {fmt % args}")
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
-        return self.rfile.read(length).decode("utf-8", errors="replace")
+        debug_log(f"_read_body content_length={length}")
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        debug_log(f"_read_body body_preview={body[:500]!r}")
+        return body
 
     def _ok(self):
         body = b"OK"
+        debug_log("_ok sending OK response")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
@@ -175,6 +256,7 @@ class ADMSHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         qs     = urllib.parse.parse_qs(parsed.query)
         sn     = qs.get("SN", ["?"])[0]
+        debug_log(f"do_GET path={self.path!r}, client={self.client_address!r}, qs={qs!r}, sn={sn!r}")
 
         print(f"[ADMS] GET {self.path} | SN={sn}")
 
@@ -206,6 +288,7 @@ class ADMSHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        debug_log(f"do_GET sent registration response sn={sn!r}, body_len={len(body)}")
         print(f"[ADMS] ✅ Sent registration response to SN={sn} — device will now push ALL attendance records")
 
     def do_POST(self):
@@ -214,12 +297,14 @@ class ADMSHandler(http.server.BaseHTTPRequestHandler):
         raw_body   = self._read_body()
         body_params = urllib.parse.parse_qs(raw_body)
         params     = {**qs, **body_params}
+        debug_log(f"do_POST path={self.path!r}, client={self.client_address!r}, qs={qs!r}, body_params_keys={list(body_params.keys())!r}, raw_body_preview={raw_body[:500]!r}")
 
         sn    = params.get("SN",    ["?"])[0]
         table = params.get("table", [""])[0]
 
         print(f"[ADMS] POST {self.path} | SN={sn} table={table}")
         print(f"[ADMS] Body: {raw_body[:500]}")
+        debug_log(f"do_POST parsed sn={sn!r}, table={table!r}")
 
         saved = 0
         # ATTLOG can arrive as multiple lines in the body
@@ -229,6 +314,7 @@ class ADMSHandler(http.server.BaseHTTPRequestHandler):
             if not line:
                 continue
             parts = line.split("\t") if "\t" in line else line.split()
+            debug_log(f"do_POST processing line={line!r}, parts={parts!r}")
             if len(parts) >= 3:
                 try:
                     user_id = parts[0].strip()
@@ -249,8 +335,10 @@ class ADMSHandler(http.server.BaseHTTPRequestHandler):
                     }
                     _store_record(record)
                     saved += 1
+                    debug_log(f"do_POST saved line punch employee={user_id!r}, stamp={stamp!r}, punch_type={punch_type!r}, saved={saved}")
                     print(f"[ADMS] ✅ Punch: emp={user_id} time={stamp} type={punch_type}")
                 except Exception as e:
+                    debug_log(f"do_POST could not parse line={line!r}", e)
                     print(f"[ADMS] ⚠️  Could not parse line '{line}': {e}")
 
         # Also try query-string / form-encoded single record (some firmware variants)
@@ -260,15 +348,18 @@ class ADMSHandler(http.server.BaseHTTPRequestHandler):
                 record["deviceId"] = sn
                 _store_record(record)
                 saved += 1
+                debug_log(f"do_POST saved form punch employee={record['employeeId']!r}, timestamp={record['timestamp']!r}, saved={saved}")
                 print(f"[ADMS] ✅ Punch (form): emp={record['employeeId']} "
                       f"time={record['timestamp']} type={record['punchType']}")
 
         if saved == 0:
+            debug_log("do_POST no punch records parsed")
             print(f"[ADMS] ℹ️  No punch records parsed from POST body")
 
         # Forward POST request to ESSL portal (relay)
         _relay_to_essl("POST", self.path, raw_body.encode("utf-8"))
 
+        debug_log(f"do_POST completed saved={saved}")
         self._ok()
 
 
@@ -283,14 +374,18 @@ _thread = None
 def start(port=ADMS_PORT):
     global _server, _thread
     if _server:
+        debug_log(f"start skipped existing server port={port}")
         return True
     try:
+        debug_log(f"start attempting port={port}")
         _server = http.server.HTTPServer(("0.0.0.0", port), ADMSHandler)
         _thread = threading.Thread(target=_server.serve_forever, daemon=True)
         _thread.start()
+        debug_log(f"start success port={port}, thread_alive={_thread.is_alive()}")
         print(f"[ADMS] Listener started on port {port}")
         return True
     except Exception as e:
+        debug_log(f"start failed port={port}", e)
         print(f"[ADMS] Failed to start: {e}")
         _server = None
         return False
@@ -299,9 +394,11 @@ def start(port=ADMS_PORT):
 def stop():
     global _server, _thread
     if _server:
+        debug_log("stop called")
         _server.shutdown()
         _server = None
         _thread = None
+        debug_log("stop completed")
         print("[ADMS] Listener stopped")
 
 

@@ -19,20 +19,6 @@ import html
 from zk import ZK, const
 from datetime import datetime
 
-# Fix for Windows threading bug with strptime
-try:
-    import _strptime
-except ImportError:
-    datetime.strptime('2000-01-01', '%Y-%m-%d')
-
-# Thread-safe strptime wrapper
-def safe_strptime(date_string, format_string):
-    try:
-        return datetime.strptime(date_string, format_string)
-    except AttributeError:
-        import time
-        return datetime(*time.strptime(date_string, format_string)[:6])
-
 
 # ──────────────────────────────────────────────
 # Punch-type helpers
