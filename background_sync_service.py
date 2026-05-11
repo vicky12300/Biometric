@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,6 +28,7 @@ DEFAULT_INTERVAL_MINUTES = 5
 LOOKBACK_HOURS = 24
 STATE_FILENAME = "auto_sync_state.json"
 LOG_FILENAME = "auto_sync_service.log"
+LOCK_FILENAME = "auto_sync_service.lock"
 
 
 class BackgroundSyncService:
@@ -47,6 +49,7 @@ class BackgroundSyncService:
 
         self.state: Dict[str, Any] = self._load_state()
         self.force_mode = force_mode
+        self.adms_listener_started = False
         
         if self.force_mode:
             self.logger.info("BackgroundSyncService initialised in FORCE MODE; data dir=%s", self.data_dir)
@@ -128,6 +131,9 @@ class BackgroundSyncService:
             self.logger.info("No devices configured; nothing to sync")
             return interval
 
+        if any(device.get("mode") == "adms" for device in devices):
+            self._ensure_adms_listener()
+
         now = datetime.utcnow()
         all_records: List[Dict[str, Any]] = []
         device_updates: Dict[str, str] = {}
@@ -150,12 +156,21 @@ class BackgroundSyncService:
                     adms_records = storage.load_adms_punches()
                     
                     # Filter records for this device and after last_seen
-                    device_sn = device.get("serialNumber") or device.get("ip") or device_id
+                    device_sn = device.get("serialNumber")
+                    device_ip = device.get("ip")
                     filtered_records = []
                     for rec in adms_records:
                         rec_device = rec.get("deviceId", "")
                         rec_ts = rec.get("timestamp", "")
-                        if rec_device == device_sn or rec_device == device_id:
+                        device_matches = (
+                            rec_device == device_sn
+                            or rec_device == device_ip
+                            or rec_device == device_id
+                            or rec_device == "unknown"
+                            or (device_ip and device_ip in rec_device)
+                            or not device_sn
+                        )
+                        if device_matches:
                             if not last_seen or rec_ts > last_seen:
                                 filtered_records.append(rec)
                     
@@ -216,6 +231,7 @@ class BackgroundSyncService:
                 enriched.setdefault("deviceName", device.get("name") or device.get("ip") or device_id)
                 enriched["latitude"] = device.get("latitude")
                 enriched["longitude"] = device.get("longitude")
+                enriched["_syncDeviceId"] = device_id
                 new_records.append(enriched)
 
                 if latest_ts is None or ts > latest_ts:
@@ -249,11 +265,22 @@ class BackgroundSyncService:
             self.logger.error("ERP sync failed: %s", exc)
             return interval
 
-        if response.get("success"):
+        details = response.get("details") or {}
+        success_count = int(details.get("success", 0) or 0)
+
+        if response.get("success") and success_count > 0:
             self.logger.info("ERP sync successful: %s", response.get("message"))
             self._record_sync_history(len(all_records), response)
             # Persist last-seen timestamps only after successful push
-            for key, ts in device_updates.items():
+            successful_updates: Dict[str, str] = {}
+            for success_record in details.get("success_records") or []:
+                key = str(success_record.get("device_key") or "")
+                ts = success_record.get("timestamp")
+                if key and ts and (key not in successful_updates or ts > successful_updates[key]):
+                    successful_updates[key] = ts
+
+            updates_to_apply = successful_updates or device_updates
+            for key, ts in updates_to_apply.items():
                 self.state.setdefault("devices", {})[key] = ts
                 # Also update the device record in storage so UI shows lastSync
                 try:
@@ -262,10 +289,32 @@ class BackgroundSyncService:
                 except Exception as e:
                     self.logger.warning("Failed to update device lastSync for %s: %s", key, e)
             self._save_state()
+        elif response.get("success"):
+            self.logger.warning(
+                "ERP sync returned no successful records; lastSync not updated: %s",
+                response.get("message"),
+            )
+            self._record_sync_history(len(all_records), response)
         else:
             self.logger.error("ERP sync failed: %s", response.get("error") or response.get("message"))
 
         return interval
+
+    # ------------------------------------------------------------------
+    # ADMS listener handling
+    # ------------------------------------------------------------------
+    def _ensure_adms_listener(self) -> None:
+        if self.adms_listener_started:
+            return
+
+        try:
+            if adms_listener.start(8000):
+                self.adms_listener_started = True
+                self.logger.info("ADMS listener started for background sync on port 8000")
+            else:
+                self.logger.warning("ADMS listener could not start on port 8000")
+        except Exception as exc:
+            self.logger.warning("Failed to start ADMS listener for background sync: %s", exc)
 
     # ------------------------------------------------------------------
     # History helpers
@@ -325,7 +374,26 @@ def main() -> None:
     args = parser.parse_args()
     
     service = BackgroundSyncService(force_mode=args.force)
-    service.run_forever()
+    lock_handle = None
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_path = service.data_dir / LOCK_FILENAME
+            lock_handle = lock_path.open("a+")
+            try:
+                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                service.logger.warning("Another background sync service instance is already running; exiting")
+                return
+
+        service.run_forever()
+    finally:
+        if lock_handle:
+            try:
+                lock_handle.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

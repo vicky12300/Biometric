@@ -99,8 +99,18 @@ builtins.__import__ = _debug_import
 
 class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
     # ... rest of the code remains the same
+    def _write_response(self, payload):
+        try:
+            if isinstance(payload, str):
+                payload = payload.encode()
+            self.wfile.write(payload)
+            return True
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError) as exc:
+            debug_log(f"Client disconnected before response completed path={self.path!r}", exc)
+            return False
+
     def do_GET(self):
-        if self.path == '/':
+        if self.path == '/' or self.path.startswith('/?'):
             self.send_response(200)
             self.send_header('Content-type', 'text/html')
             # Add cache-busting headers to prevent browser caching
@@ -1862,9 +1872,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             
             if (input.value) {
                 const date = new Date(input.value);
-                devices[deviceIndex].lastSync = date.toLocaleString();
-                // Also save to localStorage for sync logic
-                localStorage.setItem(`lastSync_${deviceId}`, date.toISOString());
+                setDeviceLastSync(devices[deviceIndex], date);
             } else {
                 devices[deviceIndex].lastSync = null;
                 localStorage.removeItem(`lastSync_${deviceId}`);
@@ -1951,7 +1959,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                         </span>
                     </td>
                     <td style="padding: 10px; border: 1px solid #ddd;">
-                        <span id="lastSync_${device.id}">${device.lastSync || 'Never'}</span>
+                        <span id="lastSync_${device.id}">${formatLastSync(device.lastSync)}</span>
                         ${isAdmin() ? `
                             <button onclick="editLastSync('${device.id}')" 
                                     style="background: none; border: none; color: #007cba; cursor: pointer; margin-left: 5px; font-size: 0.9em;" 
@@ -2089,12 +2097,13 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                 
                 if (lastSyncTime) {
                     // Use lastSync as start date
-                    startDate = new Date(lastSyncTime);
+                    startDate = parseSyncTime(lastSyncTime);
                     console.log(`Using lastSync as start date: ${startDate.toISOString()}`);
                 } else if (device.lastSync && device.lastSync !== 'Never') {
                     // Fallback to device.lastSync if localStorage doesn't have it
                     try {
-                        startDate = new Date(device.lastSync);
+                        startDate = parseSyncTime(device.lastSync);
+                        if (!startDate) throw new Error('Invalid lastSync');
                         console.log(`Using device.lastSync as start date: ${startDate.toISOString()}`);
                     } catch (e) {
                         // If parsing fails, default to 7 days
@@ -2179,8 +2188,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
 
                         if (latestRecordTime) {
                             console.log(`  📅 Setting lastSync to: ${latestRecordTime.toISOString()} (${latestRecordTime.toLocaleString()})`);
-                            device.lastSync = latestRecordTime.toLocaleString();
-                            localStorage.setItem(`lastSync_${device.id}`, latestRecordTime.toISOString());
+                            setDeviceLastSync(device, latestRecordTime);
                         } else {
                             console.warn(`  ⚠️ No valid latestRecordTime found! lastSync NOT updated`);
                         }
@@ -2292,6 +2300,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             const endDate = document.getElementById('endDate').value;
             const selectedDevice = document.getElementById('selectedDevice').value;
             const dummyMode = document.getElementById('dummyMode').checked;
+            console.log('Report fetch started', { startDate, endDate, selectedDevice, dummyMode, devices: devices.map(d => ({ id: d.id, name: d.name, ip: d.ip, mode: d.mode })) });
             
             const deviceCount = selectedDevice ? 1 : devices.length;
             loaderSubtextLastUpdate = 0;
@@ -2305,6 +2314,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                     const device = devices.find(d => d.id === selectedDevice);
                     if (device) {
                         const data = await fetchDeviceData(device, startDate, endDate, dummyMode);
+                        console.log('Report selected device response', device.name, data);
                         if (data.success) {
                             // Enrich records with device name
                             allData = (data.punchRecords || []).map(record => ({
@@ -2321,6 +2331,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                         const device = devices[i];
                         updateLoaderSubtext(`Fetching device ${i + 1} of ${deviceCount}...`);
                         const data = await fetchDeviceData(device, startDate, endDate, dummyMode);
+                        console.log('Report device response', device.name, data);
                         if (data.success) {
                             allData = allData.concat((data.punchRecords || []).map(record => ({
                                 ...record,
@@ -2334,6 +2345,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                 }
                 
                 allRecords = allData;
+                console.log('Report fetch completed records', allData.length);
                 filteredRecords = allData;
                 currentPage = 1;
                 showDataStats();
@@ -2361,7 +2373,9 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             });
             
             const response = await fetch('/fetch?' + params);
-            return await response.json();
+            const result = await response.json();
+            console.log('fetchDeviceData result', device.name || device.ip, result.success, result.message || result.error, (result.punchRecords || []).length);
+            return result;
         }
 
         function showDataStats() {
@@ -2711,6 +2725,24 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                 intervalSeconds: parseInt(document.getElementById('punchFilterInterval').value) || 3
             };
         }
+
+        function parseSyncTime(value) {
+            if (!value || value === 'Never') return null;
+            const parsed = new Date(value);
+            return Number.isNaN(parsed.getTime()) ? null : parsed;
+        }
+
+        function setDeviceLastSync(device, latestTime) {
+            if (!device || !latestTime || Number.isNaN(latestTime.getTime())) return;
+            const syncTimeISO = latestTime.toISOString();
+            device.lastSync = syncTimeISO;
+            localStorage.setItem(`lastSync_${device.id}`, syncTimeISO);
+        }
+
+        function formatLastSync(value) {
+            const parsed = parseSyncTime(value);
+            return parsed ? parsed.toLocaleString() : (value || 'Never');
+        }
         
         function toggleAutoSync() {
             if (!isAdmin()) {
@@ -2806,10 +2838,10 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                             const storedLastSync = localStorage.getItem(lastSyncKey);
                             
                             if (storedLastSync) {
-                                deviceLastSync = new Date(storedLastSync);
+                                deviceLastSync = parseSyncTime(storedLastSync);
                             } else if (device.lastSync && device.lastSync !== 'Never') {
                                 try {
-                                    deviceLastSync = new Date(device.lastSync);
+                                    deviceLastSync = parseSyncTime(device.lastSync);
                                 } catch (e) {
                                     // Parsing failed, use 7 days
                                 }
@@ -2832,6 +2864,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                                 const recordTime = new Date(record.timestamp);
                                 return !deviceLastSync || recordTime > deviceLastSync;
                             });
+                            addSyncLog(`${device.name}: fetched ${data.punchRecords.length}, new ${newRecords.length}`, newRecords.length > 0 ? 'info' : 'info');
 
                             if (newRecords.length > 0) {
                                 // Track latest time for this device
@@ -2862,7 +2895,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                 
                 if (allNewRecords.length === 0) {
                     console.log('Auto-sync: No new punches found');
-                    lastSyncTime = latestRecordTime || lastSyncTime;
+                    addSyncLog('No new punches found', 'info');
                     return;
                 }
                 
@@ -2925,11 +2958,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                         for (const [deviceId, latestTime] of Object.entries(deviceLatestTimes)) {
                             const device = devices.find(d => d.id === deviceId);
                             if (device) {
-                                const syncTimeISO = latestTime.toISOString();
-                                const syncTimeDisplay = latestTime.toLocaleString();
-                                
-                                device.lastSync = syncTimeDisplay;
-                                localStorage.setItem(`lastSync_${deviceId}`, syncTimeISO);
+                                setDeviceLastSync(device, latestTime);
                             }
                         }
                         await saveDevicesToServer();
@@ -3085,8 +3114,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                                     // Update last sync time only if records were successfully sent
                                     if (successCount > 0) {
                                         const latestTime = latestRecordTime || now;
-                                        device.lastSync = latestTime.toLocaleString();
-                                        localStorage.setItem(`lastSync_${device.id}`, latestTime.toISOString());
+                                        setDeviceLastSync(device, latestTime);
                                     }
                                     
                                     addSyncLog(`${device.name}: ${successCount} records synced`, 'success');
@@ -4246,7 +4274,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                         
                         let startDate;
                         if (lastSyncTime) {
-                            startDate = new Date(lastSyncTime);
+                            startDate = parseSyncTime(lastSyncTime);
                         } else {
                             // If no last sync, get last 24 hours
                             startDate = new Date(Date.now() - 24 * 60 * 60 * 1000);
@@ -4275,7 +4303,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                             // Filter records newer than last sync
                             const newRecords = data.punchRecords.filter(record => {
                                 const recordTime = new Date(record.timestamp);
-                                return !lastSyncTime || recordTime > new Date(lastSyncTime);
+                                return !lastSyncTime || recordTime > parseSyncTime(lastSyncTime);
                             });
                             
                             if (newRecords.length > 0) {
@@ -4317,8 +4345,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                                         }
                                         
                                         if (latestRecordTime) {
-                                            device.lastSync = latestRecordTime.toLocaleString();
-                                            localStorage.setItem(`lastSync_${device.id}`, latestRecordTime.toISOString());
+                                            setDeviceLastSync(device, latestRecordTime);
                                             console.log(`Recovered ${successCount} records from ${device.name}, lastSync set to ${latestRecordTime.toISOString()}`);
                                         }
                                     }
@@ -4491,7 +4518,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps(result).encode())
+            self._write_response(json.dumps(result).encode())
             
         elif self.path in ('/Auriga - Original.jpg', '/Auriga%20-%20Original.jpg'):
             try:
@@ -4819,11 +4846,13 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
         
         records = data.get('data', [])
         erp_config = data.get('erpConfig', {})
+        debug_log(f"handle_send_to_erp started records={len(records)}, system={erp_config.get('system')!r}, url_present={bool(erp_config.get('url'))}, api_key_present={bool(erp_config.get('apiKey'))}")
         
         if erp_config.get('system') == 'frappe':
             result = self.send_to_frappe(records, erp_config)
         else:
             result = {'success': True, 'message': f'Successfully sent {len(records)} records to ERP'}
+        debug_log(f"handle_send_to_erp result success={result.get('success')!r}, message={result.get('message')!r}, error={result.get('error')!r}, details={result.get('details')!r}")
         
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
@@ -4901,7 +4930,8 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             
             # Sort by timestamp descending (newest first)
             device_records = sorted(device_records, key=lambda x: x['timestamp'], reverse=True)
-            debug_log(f"fetch_adms_data success final_count={len(device_records)}")
+            latest_timestamp = device_records[0].get('timestamp') if device_records else None
+            debug_log(f"fetch_adms_data success final_count={len(device_records)}, latest_timestamp={latest_timestamp!r}")
 
             return {
                 'success': True,
@@ -5263,6 +5293,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             error_count = 0
             skipped_count = 0
             errors = []
+            success_records = []
             
             print(f"DEBUG: Starting to process {len(records)} records for ERP sync")
             
@@ -5367,6 +5398,11 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                         
                         if response.status in [200, 201]:
                             success_count += 1
+                            success_records.append({
+                                'device_key': record.get('_syncDeviceId'),
+                                'timestamp': record.get('timestamp'),
+                                'employeeId': employee_id
+                            })
                             print(f"DEBUG: Successfully created checkin for employee {employee_id}")
                         else:
                             error_count += 1
@@ -5432,6 +5468,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                     'skipped': skipped_count,
                     'errors': error_count,
                     'deduplicated': dedup_skipped,
+                    'success_records': success_records,
                     'error_list': errors[:5]
                 }
             }
