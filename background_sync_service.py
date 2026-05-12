@@ -137,6 +137,7 @@ class BackgroundSyncService:
         now = datetime.utcnow()
         all_records: List[Dict[str, Any]] = []
         device_updates: Dict[str, str] = {}
+        adms_device_count = sum(1 for device in devices if device.get("mode") == "adms")
 
         for device in devices:
             device_id = str(device.get("id") or device.get("ip") or device.get("name") or "unknown")
@@ -156,23 +157,32 @@ class BackgroundSyncService:
                     adms_records = storage.load_adms_punches()
                     
                     # Filter records for this device and after last_seen
-                    device_sn = device.get("serialNumber")
+                    device_sn = str(device.get("serialNumber") or "").strip()
                     device_ip = device.get("ip")
                     filtered_records = []
                     for rec in adms_records:
-                        rec_device = rec.get("deviceId", "")
+                        rec_device = str(rec.get("deviceId", "")).strip()
                         rec_ts = rec.get("timestamp", "")
-                        device_matches = (
-                            rec_device == device_sn
-                            or rec_device == device_ip
-                            or rec_device == device_id
-                            or rec_device == "unknown"
-                            or (device_ip and device_ip in rec_device)
-                            or not device_sn
-                        )
+                        if device_sn:
+                            device_matches = rec_device == device_sn
+                        elif adms_device_count <= 1:
+                            device_matches = (
+                                rec_device == device_ip
+                                or rec_device == device_id
+                                or rec_device == "unknown"
+                                or (device_ip and device_ip in rec_device)
+                            )
+                        else:
+                            device_matches = False
                         if device_matches:
                             if not last_seen or rec_ts > last_seen:
                                 filtered_records.append(rec)
+
+                    if use_adms and not device_sn and adms_device_count > 1:
+                        self.logger.warning(
+                            "%s: ADMS serialNumber is required when multiple ADMS devices are configured; skipping records",
+                            device.get("name", device_id),
+                        )
                     
                     result = {
                         "success": True,

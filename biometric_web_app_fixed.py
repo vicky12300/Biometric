@@ -1422,6 +1422,13 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                 <input type="text" id="deviceIP" placeholder="192.168.0.30">
             </div>
             <div style="margin-bottom: 15px;">
+                <label>ADMS Serial Number:</label>
+                <input type="text" id="deviceSerial" placeholder="e.g., NYU7260401414">
+                <small style="display: block; color: #666; font-size: 12px; margin-top: 5px;">
+                    Required for multiple ADMS face devices. Match the device SN exactly.
+                </small>
+            </div>
+            <div style="margin-bottom: 15px;">
                 <label>Port:</label>
                 <input type="number" id="devicePort" value="4370">
             </div>
@@ -1467,6 +1474,13 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             <div style="margin-bottom: 15px;">
                 <label>IP Address:</label>
                 <input type="text" id="editDeviceIP" placeholder="192.168.0.30">
+            </div>
+            <div style="margin-bottom: 15px;">
+                <label>ADMS Serial Number:</label>
+                <input type="text" id="editDeviceSerial" placeholder="e.g., NYU7260401414">
+                <small style="display: block; color: #666; font-size: 12px; margin-top: 5px;">
+                    Required for multiple ADMS face devices. Match the device SN exactly.
+                </small>
             </div>
             <div style="margin-bottom: 15px;">
                 <label>Port:</label>
@@ -1703,6 +1717,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             document.getElementById('deviceName').value = '';
             document.getElementById('deviceType').value = 'ZKTeco';
             document.getElementById('deviceIP').value = '';
+            document.getElementById('deviceSerial').value = '';
             document.getElementById('devicePort').value = '4370';
             document.getElementById('deviceLat').value = '';
             document.getElementById('deviceLong').value = '';
@@ -1734,6 +1749,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                 name: name,
                 type: document.getElementById('deviceType').value,
                 ip: ip,
+                serialNumber: document.getElementById('deviceSerial').value.trim() || null,
                 port: document.getElementById('devicePort').value,
                 latitude: document.getElementById('deviceLat').value.trim() || null,
                 longitude: document.getElementById('deviceLong').value.trim() || null,
@@ -1767,6 +1783,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             document.getElementById('editDeviceName').value = device.name;
             document.getElementById('editDeviceType').value = device.type;
             document.getElementById('editDeviceIP').value = device.ip;
+            document.getElementById('editDeviceSerial').value = device.serialNumber || '';
             document.getElementById('editDevicePort').value = device.port;
             document.getElementById('editDeviceLat').value = device.latitude || '';
             document.getElementById('editDeviceLong').value = device.longitude || '';
@@ -1794,6 +1811,7 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             devices[deviceIndex].name = name;
             devices[deviceIndex].type = document.getElementById('editDeviceType').value;
             devices[deviceIndex].ip = ip;
+            devices[deviceIndex].serialNumber = document.getElementById('editDeviceSerial').value.trim() || null;
             devices[deviceIndex].port = document.getElementById('editDevicePort').value;
             devices[deviceIndex].latitude = document.getElementById('editDeviceLat').value.trim() || null;
             devices[deviceIndex].longitude = document.getElementById('editDeviceLong').value.trim() || null;
@@ -2369,7 +2387,8 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                 startDate: startDate,
                 endDate: endDate,
                 dummy: useDummy,
-                mode: device.mode || 'real'
+                mode: device.mode || 'real',
+                serialNumber: device.serialNumber || ''
             });
             
             const response = await fetch('/fetch?' + params);
@@ -4502,14 +4521,15 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
             end_date = params.get('endDate', [''])[0] or None
             dummy_mode = params.get('dummy', ['false'])[0].lower() == 'true'
             device_mode = params.get('mode', ['real'])[0]
-            debug_log(f"GET /fetch resolved ip={ip!r}, port={port!r}, start_date={start_date!r}, end_date={end_date!r}, dummy_mode={dummy_mode!r}, device_mode={device_mode!r}")
+            serial_number = params.get('serialNumber', [''])[0] or None
+            debug_log(f"GET /fetch resolved ip={ip!r}, port={port!r}, start_date={start_date!r}, end_date={end_date!r}, dummy_mode={dummy_mode!r}, device_mode={device_mode!r}, serial_number={serial_number!r}")
             
             if dummy_mode:
                 debug_log("GET /fetch using dummy data path")
                 result = self.generate_dummy_data(start_date, end_date)
             elif device_mode == 'adms':
                 debug_log("GET /fetch using ADMS data path")
-                result = self.fetch_adms_data(ip, start_date, end_date)
+                result = self.fetch_adms_data(ip, start_date, end_date, serial_number)
             else:
                 debug_log("GET /fetch using ZK device data path")
                 result = self.fetch_device_data(ip, port, start_date, end_date)
@@ -4876,9 +4896,9 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
-    def fetch_adms_data(self, ip, start_date=None, end_date=None):
+    def fetch_adms_data(self, ip, start_date=None, end_date=None, serial_number=None):
         """Return punch records pushed by an ADMS device (e.g. ESSL AIFace Orcus)."""
-        debug_log(f"fetch_adms_data started ip={ip!r}, start_date={start_date!r}, end_date={end_date!r}")
+        debug_log(f"fetch_adms_data started ip={ip!r}, start_date={start_date!r}, end_date={end_date!r}, serial_number={serial_number!r}")
         try:
             from adms_listener import get_buffered_records
             all_records = storage.load_adms_punches()
@@ -4888,27 +4908,28 @@ class EnhancedBiometricHandler(http.server.SimpleHTTPRequestHandler):
                     all_records.append(r)
             debug_log(f"fetch_adms_data after buffer merge count={len(all_records)}")
 
-            # Filter by device IP or serial number
-            # ADMS records have deviceId which could be serial number or IP
+            devices = storage.load_devices() or []
+            adms_devices = [d for d in devices if d.get('mode') == 'adms']
+            device_config = next((d for d in devices if d.get('ip') == ip), None)
+            device_sn = serial_number or (device_config or {}).get('serialNumber')
+            device_sn = str(device_sn).strip() if device_sn else None
+
+            # ADMS records use deviceId from the device SN. Prefer exact serial
+            # matching so multiple face devices do not share the same punches.
             device_records = []
             for r in all_records:
-                device_id = r.get('deviceId', '')
-                # Match by IP or if deviceId contains the IP
-                if device_id == ip or ip in device_id or device_id == 'unknown':
+                device_id = str(r.get('deviceId', '')).strip()
+                if device_sn and device_id == device_sn:
                     device_records.append(r)
-            
-            # If no records matched by IP, try to get device serial number from config
-            if not device_records:
-                devices = storage.load_devices() or []
-                device_config = next((d for d in devices if d.get('ip') == ip), None)
-                if device_config:
-                    device_sn = device_config.get('serialNumber') or device_config.get('name')
-                    if device_sn:
-                        device_records = [r for r in all_records if r.get('deviceId') == device_sn]
-            
-            # If still no records, show all (backward compatibility)
-            if not device_records:
+                elif not device_sn and (device_id == ip or (ip and ip in device_id)):
+                    device_records.append(r)
+
+            # Backward compatibility for existing one-ADMS-device installs.
+            if not device_records and not device_sn and len(adms_devices) <= 1:
                 device_records = all_records
+                debug_log("fetch_adms_data using single-ADMS fallback because no serial number is configured")
+            elif not device_sn:
+                debug_log("fetch_adms_data no serial number configured; multiple ADMS devices require serialNumber")
             debug_log(f"fetch_adms_data matched device_records count={len(device_records)}")
 
             if start_date or end_date:
